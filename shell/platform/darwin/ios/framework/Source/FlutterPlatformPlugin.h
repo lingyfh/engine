@@ -1,4 +1,4 @@
-// Copyright 2016 The Chromium Authors. All rights reserved.
+// Copyright 2013 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -6,25 +6,24 @@
 #define SHELL_PLATFORM_IOS_FRAMEWORK_SOURCE_FLUTTERPLATFORMPLUGIN_H_
 
 #include "flutter/fml/memory/weak_ptr.h"
-#include "flutter/shell/platform/darwin/ios/framework/Headers/FlutterChannels.h"
-
-#include <UIKit/UIKit.h>
+#include "flutter/shell/platform/darwin/common/framework/Headers/FlutterChannels.h"
+#include "flutter/shell/platform/darwin/ios/framework/Headers/FlutterEngine.h"
 
 @interface FlutterPlatformPlugin : NSObject
 - (instancetype)init NS_UNAVAILABLE;
-- (instancetype)initWithViewController:(fml::WeakPtr<UIViewController>)viewController
-    NS_DESIGNATED_INITIALIZER;
++ (instancetype)new NS_UNAVAILABLE;
+- (instancetype)initWithEngine:(fml::WeakPtr<FlutterEngine>)engine NS_DESIGNATED_INITIALIZER;
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result;
 
 @end
 
-namespace shell {
+namespace flutter {
 
 extern const char* const kOrientationUpdateNotificationName;
 extern const char* const kOrientationUpdateNotificationKey;
 extern const char* const kOverlayStyleUpdateNotificationName;
 extern const char* const kOverlayStyleUpdateNotificationKey;
 
-}  // namespace shell
+}  // namespace flutter
 
 #endif  // SHELL_PLATFORM_IOS_FRAMEWORK_SOURCE_FLUTTERPLATFORMPLUGIN_H_

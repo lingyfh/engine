@@ -1,4 +1,4 @@
-// Copyright 2016 The Chromium Authors. All rights reserved.
+// Copyright 2013 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -13,10 +13,11 @@
 namespace {
 
 constexpr char kTextPlainFormat[] = "text/plain";
+const UInt32 kKeyPressClickSoundId = 1306;
 
 }  // namespaces
 
-namespace shell {
+namespace flutter {
 
 // TODO(abarth): Move these definitions from system_chrome_impl.cc to here.
 const char* const kOrientationUpdateNotificationName =
@@ -28,26 +29,26 @@ const char* const kOverlayStyleUpdateNotificationName =
 const char* const kOverlayStyleUpdateNotificationKey =
     "io.flutter.plugin.platform.SystemChromeOverlayNotificationKey";
 
-}  // namespace shell
+}  // namespace flutter
 
-using namespace shell;
+using namespace flutter;
 
 @implementation FlutterPlatformPlugin {
-  fml::WeakPtr<UIViewController> _viewController;
+  fml::WeakPtr<FlutterEngine> _engine;
 }
 
 - (instancetype)init {
-  @throw([NSException exceptionWithName:@"FlutterPlatformPlugin must initWithViewController"
+  @throw([NSException exceptionWithName:@"FlutterPlatformPlugin must initWithEngine"
                                  reason:nil
                                userInfo:nil]);
 }
 
-- (instancetype)initWithViewController:(fml::WeakPtr<UIViewController>)viewController {
-  FML_DCHECK(viewController) << "viewController must be set";
+- (instancetype)initWithEngine:(fml::WeakPtr<FlutterEngine>)engine {
+  FML_DCHECK(engine) << "engine must be set";
   self = [super init];
 
   if (self) {
-    _viewController = viewController;
+    _engine = engine;
   }
 
   return self;
@@ -93,9 +94,8 @@ using namespace shell;
 - (void)playSystemSound:(NSString*)soundType {
   if ([soundType isEqualToString:@"SystemSoundType.click"]) {
     // All feedback types are specific to Android and are treated as equal on
-    // iOS. The surface must (and does) adopt the UIInputViewAudioFeedback
-    // protocol
-    [[UIDevice currentDevice] playInputClick];
+    // iOS.
+    AudioServicesPlaySystemSound(kKeyPressClickSoundId);
   }
 }
 
@@ -203,8 +203,11 @@ using namespace shell;
   UIViewController* viewController = [UIApplication sharedApplication].keyWindow.rootViewController;
   if ([viewController isKindOfClass:[UINavigationController class]]) {
     [((UINavigationController*)viewController) popViewControllerAnimated:NO];
-  } else if (viewController != _viewController.get()) {
-    [_viewController.get() dismissViewControllerAnimated:NO completion:nil];
+  } else {
+    auto engineViewController = static_cast<UIViewController*>([_engine.get() viewController]);
+    if (engineViewController != viewController) {
+      [engineViewController dismissViewControllerAnimated:NO completion:nil];
+    }
   }
 }
 

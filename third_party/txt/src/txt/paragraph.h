@@ -27,8 +27,10 @@
 #include "minikin/LineBreaker.h"
 #include "paint_record.h"
 #include "paragraph_style.h"
+#include "placeholder_run.h"
 #include "styled_runs.h"
 #include "third_party/googletest/googletest/include/gtest/gtest_prod.h"  // nogncheck
+#include "third_party/skia/include/core/SkFontMetrics.h"
 #include "third_party/skia/include/core/SkRect.h"
 #include "utils/WindowsUtils.h"
 
@@ -38,8 +40,16 @@ namespace txt {
 
 using GlyphID = uint32_t;
 
-// Paragraph provides Layout, metrics, and painting capabilites for text. Once a
-// Paragraph is constructed with ParagraphBuilder::Build(), an example basic
+// Constant with the unicode codepoint for the "Object replacement character".
+// Used as a stand-in character for Placeholder boxes.
+const int objReplacementChar = 0xFFFC;
+// Constant with the unicode codepoint for the "Replacement character". This is
+// the character that commonly renders as a black diamond with a white question
+// mark. Used to replace non-placeholder instances of 0xFFFC in the text buffer.
+const int replacementChar = 0xFFFD;
+
+// Paragraph provides Layout, metrics, and painting capabilities for text. Once
+// a Paragraph is constructed with ParagraphBuilder::Build(), an example basic
 // workflow can be this:
 //
 //   std::unique_ptr<Paragraph> paragraph = paragraph_builder.Build();
@@ -55,23 +65,41 @@ class Paragraph {
 
   enum Affinity { UPSTREAM, DOWNSTREAM };
 
-  // TODO(garyq): Implement kIncludeLineSpacing and kExtendEndOfLine
-
   // Options for various types of bounding boxes provided by
   // GetRectsForRange(...).
-  // These options can be individually enabled, for example:
-  //
-  //   (RectStyle::kTight | RectStyle::kExtendEndOfLine)
-  //
-  // provides tight bounding boxes and extends the last box per line to the end
-  // of the layout area.
-  enum RectStyle {
-    kNone = 0x0,  // kNone cannot be combined with |.
+  enum class RectHeightStyle {
+    // Provide tight bounding boxes that fit heights per run.
+    kTight,
 
-    // Provide tight bounding boxes that fit heights per span. Otherwise, the
-    // heights of spans are the max of the heights of the line the span belongs
-    // in.
-    kTight = 0x1
+    // The height of the boxes will be the maximum height of all runs in the
+    // line. All rects in the same line will be the same height.
+    kMax,
+
+    // Extends the top and/or bottom edge of the bounds to fully cover any line
+    // spacing. The top edge of each line should be the same as the bottom edge
+    // of the line above. There should be no gaps in vertical coverage given any
+    // ParagraphStyle line_height.
+    //
+    // The top and bottom of each rect will cover half of the
+    // space above and half of the space below the line.
+    kIncludeLineSpacingMiddle,
+    // The line spacing will be added to the top of the rect.
+    kIncludeLineSpacingTop,
+    // The line spacing will be added to the bottom of the rect.
+    kIncludeLineSpacingBottom,
+
+    // Calculate boxes based on the strut's metrics.
+    kStrut
+  };
+
+  enum class RectWidthStyle {
+    // Provide tight bounding boxes that fit widths to the runs of each line
+    // independently.
+    kTight,
+
+    // Extends the width of the last rect of each line to match the position of
+    // the widest rect over all the lines.
+    kMax
   };
 
   struct PositionWithAffinity {
@@ -99,7 +127,7 @@ class Paragraph {
       return start == other.start && end == other.end;
     }
 
-    T width() { return end - start; }
+    T width() const { return end - start; }
 
     void Shift(T delta) {
       start += delta;
@@ -137,6 +165,12 @@ class Paragraph {
   // GetMaxWidth() >= GetLayoutWidth().
   double GetMaxWidth() const;
 
+  // Returns the width of the longest line as found in Layout(), which is
+  // defined as the horizontal distance from the left edge of the leftmost glyph
+  // to the right edge of the rightmost glyph. We expect that
+  // GetLongestLine() <= GetMaxWidth().
+  double GetLongestLine() const;
+
   // Distance from top of paragraph to the Alphabetic baseline of the first
   // line. Used for alphabetic fonts (A-Z, a-z, greek, etc.)
   double GetAlphabeticBaseline() const;
@@ -158,11 +192,23 @@ class Paragraph {
   // end glyph indexes, including start and excluding end.
   std::vector<TextBox> GetRectsForRange(size_t start,
                                         size_t end,
-                                        RectStyle rect_style) const;
+                                        RectHeightStyle rect_height_style,
+                                        RectWidthStyle rect_width_style) const;
 
   // Returns the index of the glyph that corresponds to the provided coordinate,
   // with the top left corner as the origin, and +y direction as down.
   PositionWithAffinity GetGlyphPositionAtCoordinate(double dx, double dy) const;
+
+  // Returns a vector of bounding boxes that bound all inline placeholders in
+  // the paragraph.
+  //
+  // There will be one box for each inline placeholder. The boxes will be in the
+  // same order as they were added to the paragraph. The bounds will always be
+  // tight and should fully enclose the area where the placeholder should be.
+  //
+  // More granular boxes may be obtained through GetRectsForRange, which will
+  // return bounds on both text as well as inline placeholders.
+  std::vector<Paragraph::TextBox> GetRectsForPlaceholders() const;
 
   // Finds the first and last glyphs that define a word containing the glyph at
   // index offset.
@@ -193,6 +239,7 @@ class Paragraph {
   FRIEND_TEST_WINDOWS_DISABLED(ParagraphTest, RightAlignParagraph);
   FRIEND_TEST_WINDOWS_DISABLED(ParagraphTest, CenterAlignParagraph);
   FRIEND_TEST_WINDOWS_DISABLED(ParagraphTest, JustifyAlignParagraph);
+  FRIEND_TEST_WINDOWS_DISABLED(ParagraphTest, JustifyRTL);
   FRIEND_TEST(ParagraphTest, DecorationsParagraph);
   FRIEND_TEST(ParagraphTest, ItalicsParagraph);
   FRIEND_TEST(ParagraphTest, ChineseParagraph);
@@ -206,11 +253,27 @@ class Paragraph {
   FRIEND_TEST(ParagraphTest, RepeatLayoutParagraph);
   FRIEND_TEST(ParagraphTest, Ellipsize);
   FRIEND_TEST(ParagraphTest, UnderlineShiftParagraph);
+  FRIEND_TEST(ParagraphTest, WavyDecorationParagraph);
   FRIEND_TEST(ParagraphTest, SimpleShadow);
   FRIEND_TEST(ParagraphTest, ComplexShadow);
+  FRIEND_TEST(ParagraphTest, FontFallbackParagraph);
+  FRIEND_TEST(ParagraphTest, InlinePlaceholder0xFFFCParagraph);
+  FRIEND_TEST(ParagraphTest, FontFeaturesParagraph);
 
   // Starting data to layout.
   std::vector<uint16_t> text_;
+  // A vector of PlaceholderRuns, which detail the sizes, positioning and break
+  // behavior of the empty spaces to leave. Each placeholder span corresponds to
+  // a 0xFFFC (object replacement character) in text_, which indicates the
+  // position in the text where the placeholder will occur. There should be an
+  // equal number of 0xFFFC characters and elements in this vector.
+  std::vector<PlaceholderRun> inline_placeholders_;
+  // The indexes of the boxes that correspond to an inline placeholder.
+  std::vector<size_t> inline_placeholder_boxes_;
+  // The indexes of instances of 0xFFFC that correspond to placeholders. This is
+  // necessary since the user may pass in manually entered 0xFFFC values using
+  // AddText().
+  std::unordered_set<size_t> obj_replacement_char_indexes_;
   StyledRuns runs_;
   ParagraphStyle paragraph_style_;
   std::shared_ptr<FontCollection> font_collection_;
@@ -240,21 +303,70 @@ class Paragraph {
   std::vector<double> line_baselines_;
   bool did_exceed_max_lines_;
 
+  // Strut metrics of zero will have no effect on the layout.
+  struct StrutMetrics {
+    double ascent = 0;  // Positive value to keep signs clear.
+    double descent = 0;
+    double leading = 0;
+    double half_leading = 0;
+    double line_height = 0;
+    bool force_strut = false;
+  };
+
+  StrutMetrics strut_;
+
+  // Metrics for use in GetRectsForRange(...);
+  // Per-line max metrics over all runs in a given line.
+  std::vector<SkScalar> line_max_spacings_;
+  std::vector<SkScalar> line_max_descent_;
+  std::vector<SkScalar> line_max_ascent_;
+  // Overall left and right extremes over all lines.
+  double max_right_;
+  double min_left_;
+
   class BidiRun {
    public:
+    // Constructs a BidiRun with is_ghost defaulted to false.
     BidiRun(size_t s, size_t e, TextDirection d, const TextStyle& st)
-        : start_(s), end_(e), direction_(d), style_(&st) {}
+        : start_(s), end_(e), direction_(d), style_(&st), is_ghost_(false) {}
+
+    // Constructs a BidiRun with a custom is_ghost flag.
+    BidiRun(size_t s,
+            size_t e,
+            TextDirection d,
+            const TextStyle& st,
+            bool is_ghost)
+        : start_(s), end_(e), direction_(d), style_(&st), is_ghost_(is_ghost) {}
+
+    // Constructs a placeholder bidi run.
+    BidiRun(size_t s,
+            size_t e,
+            TextDirection d,
+            const TextStyle& st,
+            PlaceholderRun& placeholder)
+        : start_(s),
+          end_(e),
+          direction_(d),
+          style_(&st),
+          placeholder_run_(&placeholder) {}
 
     size_t start() const { return start_; }
     size_t end() const { return end_; }
+    size_t size() const { return end_ - start_; }
     TextDirection direction() const { return direction_; }
     const TextStyle& style() const { return *style_; }
+    PlaceholderRun* placeholder_run() const { return placeholder_run_; }
     bool is_rtl() const { return direction_ == TextDirection::rtl; }
+    // Tracks if the run represents trailing whitespace.
+    bool is_ghost() const { return is_ghost_; }
+    bool is_placeholder_run() const { return placeholder_run_ != nullptr; }
 
    private:
     size_t start_, end_;
     TextDirection direction_;
     const TextStyle* style_;
+    bool is_ghost_;
+    PlaceholderRun* placeholder_run_ = nullptr;
   };
 
   struct GlyphPosition {
@@ -283,15 +395,17 @@ class Paragraph {
     Range<size_t> code_units;
     Range<double> x_pos;
     size_t line_number;
-    SkPaint::FontMetrics font_metrics;
+    SkFontMetrics font_metrics;
     TextDirection direction;
+    const PlaceholderRun* placeholder_run;
 
     CodeUnitRun(std::vector<GlyphPosition>&& p,
                 Range<size_t> cu,
                 Range<double> x,
                 size_t line,
-                const SkPaint::FontMetrics& metrics,
-                TextDirection dir);
+                const SkFontMetrics& metrics,
+                TextDirection dir,
+                const PlaceholderRun* placeholder);
 
     void Shift(double delta);
   };
@@ -302,10 +416,13 @@ class Paragraph {
   // Holds the positions of each range of code units in the text.
   // Sorted in code unit index order.
   std::vector<CodeUnitRun> code_unit_runs_;
+  // Holds the positions of the inline placeholders.
+  std::vector<CodeUnitRun> inline_placeholder_code_unit_runs_;
 
   // The max width of the paragraph as provided in the most recent Layout()
   // call.
   double width_ = -1.0f;
+  double longest_line_ = -1.0f;
   double max_intrinsic_width_ = 0;
   double min_intrinsic_width_ = 0;
   double alphabetic_baseline_ = FLT_MAX;
@@ -331,11 +448,27 @@ class Paragraph {
 
   void SetFontCollection(std::shared_ptr<FontCollection> font_collection);
 
+  void SetInlinePlaceholders(
+      std::vector<PlaceholderRun> inline_placeholders,
+      std::unordered_set<size_t> obj_replacement_char_indexes);
+
   // Break the text into lines.
   bool ComputeLineBreaks();
 
   // Break the text into runs based on LTR/RTL text direction.
   bool ComputeBidiRuns(std::vector<BidiRun>* result);
+
+  // Calculates and populates strut based on paragraph_style_ strut info.
+  void ComputeStrut(StrutMetrics* strut, SkFont& font);
+
+  // Adjusts the ascent and descent based on the existence and type of
+  // placeholder. This method sets the proper metrics to achieve the different
+  // PlaceholderAlignment options.
+  void ComputePlaceholder(PlaceholderRun* placeholder_run,
+                          double& ascent,
+                          double& descent);
+
+  bool IsStrutValid() const;
 
   // Calculate the starting X offset of a line based on the line's width and
   // alignment.
@@ -345,6 +478,14 @@ class Paragraph {
   void PaintDecorations(SkCanvas* canvas,
                         const PaintRecord& record,
                         SkPoint base_offset);
+
+  // Computes the beziers for a wavy decoration. The results will be
+  // applied to path.
+  void ComputeWavyDecoration(SkPath& path,
+                             double x,
+                             double y,
+                             double width,
+                             double thickness);
 
   // Draws the background onto the canvas.
   void PaintBackground(SkCanvas* canvas,
